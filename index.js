@@ -1,201 +1,122 @@
 #!/usr/bin/env bun
+
 import { Database } from "bun:sqlite";
-import path from "node:path";
+import { join } from "node:path";
 
-class AnkiDatabase {
-  constructor(dbPath) {
-    this.db = new Database(dbPath);
-  }
-
-  /**
-   * Get basic collection overview
-   * @returns {Object} Collection statistics
-   */
-  getOverview() {
-    const stmt = this.db.prepare(`
-      SELECT 
-        (SELECT COUNT(*) FROM cards) as total_cards,
-        (SELECT COUNT(DISTINCT did) FROM cards) as total_decks,
-        (SELECT COUNT(*) FROM notes) as total_notes,
-        (SELECT COUNT(*) FROM revlog) as total_reviews
-    `);
-    return stmt.get();
-  }
-
-  /**
-   * Find cards by keyword in note content
-   * @param {string} keyword - Keyword to search for
-   * @param {Object} options - Optional search parameters
-   * @returns {Array} Matching cards
-   */
-  findCardsByKeyword(keyword, options = {}) {
-    const {
-      limit = 100,
-      offset = 0,
-      deck = null,
-      caseSensitive = false,
-    } = options;
-
-    const searchOperator = caseSensitive ? "LIKE BINARY" : "LIKE";
-    const searchParam = `%${keyword}%`;
-
-    let query = `
-      SELECT 
-        n.id as note_id, 
-        c.id as card_id, 
-        n.flds as note_fields,
-        d.name as deck_name
-      FROM notes n
-      JOIN cards c ON n.id = c.nid
-      JOIN decks d ON c.did = d.id
-      WHERE n.flds ${searchOperator} ?
-    `;
-
-    const params = [searchParam];
-
-    if (deck) {
-      query += " AND d.name = ?";
-      params.push(deck);
-    }
-
-    query += " LIMIT ? OFFSET ?";
-    params.push(limit, offset);
-
-    const stmt = this.db.prepare(query);
-    return stmt.all(...params);
-  }
-
-  /**
-   * Get review statistics
-   * @param {Object} options - Optional filter parameters
-   * @returns {Object} Review statistics
-   */
-  getReviewStats(options = {}) {
-    const { startDate = null, endDate = null } = options;
-
-    let query = `
-      SELECT 
-        COUNT(*) as total_reviews,
-        MIN(id) as first_review,
-        MAX(id) as last_review,
-        AVG(time) as avg_review_time,
-        SUM(CASE WHEN ease = 1 THEN 1 ELSE 0 END) as again_count,
-        SUM(CASE WHEN ease = 2 THEN 1 ELSE 0 END) as hard_count,
-        SUM(CASE WHEN ease = 3 THEN 1 ELSE 0 END) as good_count,
-        SUM(CASE WHEN ease = 4 THEN 1 ELSE 0 END) as easy_count
-      FROM revlog
-    `;
-
-    const params = [];
-    const conditions = [];
-
-    if (startDate) {
-      conditions.push("id >= ?");
-      params.push(startDate);
-    }
-
-    if (endDate) {
-      conditions.push("id <= ?");
-      params.push(endDate);
-    }
-
-    if (conditions.length) {
-      query += " WHERE " + conditions.join(" AND ");
-    }
-
-    const stmt = this.db.prepare(query);
-    return stmt.get(...params);
-  }
-
-  /**
-   * Get detailed deck information
-   * @returns {Array} Deck details with card counts
-   */
-  getDeckDetails() {
-    const stmt = this.db.prepare(`
-      SELECT 
-        id as deck_id,
-        name as deck_name,
-        (SELECT COUNT(*) FROM cards WHERE did = decks.id) as total_cards,
-        (SELECT COUNT(*) FROM cards WHERE did = decks.id AND queue = 0) as new_cards,
-        (SELECT COUNT(*) FROM cards WHERE did = decks.id AND queue = 1) as learning_cards,
-        (SELECT COUNT(*) FROM cards WHERE did = decks.id AND queue = 2) as review_cards
-      FROM decks
-      ORDER BY total_cards DESC
-    `);
-    return stmt.all();
-  }
-
-  /**
-   * Close the database connection
-   */
-  close() {
-    this.db.close();
-  }
-}
-
-// Utility function to get Anki database path
-function getAnkiDatabasePath() {
-  const homeDir = process.env.HOME;
-  return path.join(
-    homeDir,
+const AnkiUtils = {
+  DB_PATH: join(
+    process.env.HOME || "",
     "Library",
     "Application Support",
     "Anki2",
     "alien",
     "collection.anki2"
-  );
-}
+  ),
 
-// CLI Interface
+  withDatabase(callback, { readonly = true } = {}) {
+    const db = new Database(this.DB_PATH, { readonly });
+
+    try {
+      return callback(db);
+    } finally {
+      db.close();
+    }
+  },
+
+  searchCards({
+    keyword = "",
+    deck = null,
+    sortBy = "last_review_time",
+    limit = 9999,
+    minReviewCount = 0,
+    easeFactor = null,
+    fields = ["front", "back"],
+  } = {}) {
+    return this.withDatabase((db) => {
+      const query = `
+        WITH card_stats AS (
+          SELECT 
+            c.id as card_id,
+            COUNT(*) as review_count,
+            AVG(r.time) as avg_review_time,
+            MAX(r.id) as last_review_time,
+            MAX(r.ease) as last_ease_factor
+          FROM cards c
+          LEFT JOIN revlog r ON r.cid = c.id
+          GROUP BY c.id
+        )
+        SELECT 
+          n.id as note_id, 
+          c.id as card_id, 
+          n.flds as note_fields,
+          d.name as deck_name,
+          COALESCE(cs.review_count, 0) as review_count,
+          cs.avg_review_time,
+          cs.last_review_time,
+          cs.last_ease_factor
+        FROM notes n
+        JOIN cards c ON n.id = c.nid
+        JOIN decks d ON c.did = d.id
+        LEFT JOIN card_stats cs ON cs.card_id = c.id
+        WHERE 1=1
+        ${keyword ? "AND n.flds LIKE ?" : ""}
+        ${deck ? "AND d.name = ?" : ""}
+        ${minReviewCount > 0 ? "AND COALESCE(cs.review_count, 0) >= ?" : ""}
+        ${easeFactor ? "AND cs.last_ease_factor = ?" : ""}
+        ORDER BY cs.${sortBy} DESC NULLS LAST 
+        LIMIT ?`;
+
+      const params = [];
+      if (keyword) params.push(`%${keyword}%`);
+      if (deck) params.push(deck);
+      if (minReviewCount > 0) params.push(minReviewCount);
+      if (easeFactor) params.push(easeFactor);
+      params.push(limit);
+
+      const results = db.query(query).all(...params);
+
+      return results.map((result) => {
+        const fieldsData = result.note_fields.split("\u001f");
+        const fieldMap = {
+          front: fieldsData[0],
+          back: fieldsData[1] || null,
+        };
+
+        return fields.reduce(
+          (acc, field) => {
+            if (fieldMap[field] !== undefined) {
+              acc[field] = fieldMap[field];
+            }
+            return acc;
+          },
+          { ...result }
+        );
+      });
+    });
+  },
+};
+
 function main() {
-  const dbPath = getAnkiDatabasePath();
-  const db = new AnkiDatabase(dbPath);
+  const command = process.argv[2];
+  const args = process.argv.slice(3);
 
   try {
-    const command = process.argv[2];
-    const arg1 = process.argv[3];
-    const arg2 = process.argv[4];
-
-    switch (command) {
-      case "overview":
-        console.log(JSON.stringify(db.getOverview(), null, 2));
-        break;
-      case "search":
-        if (!arg1) {
-          console.error("Please provide a search keyword");
-          process.exit(1);
-        }
-        console.log(
-          JSON.stringify(
-            db.findCardsByKeyword(arg1, {
-              deck: arg2,
-              limit: 50,
-            }),
-            null,
-            2
-          )
-        );
-        break;
-      case "reviews":
-        console.log(JSON.stringify(db.getReviewStats(), null, 2));
-        break;
-      case "decks":
-        console.log(JSON.stringify(db.getDeckDetails(), null, 2));
-        break;
-      default:
-        console.log("Available commands:");
-        console.log("- overview: Get collection statistics");
-        console.log("- search <keyword> [deck]: Search cards by keyword");
-        console.log("- reviews: Get review statistics");
-        console.log("- decks: Get detailed deck information");
-        process.exit(1);
+    if (command === "search") {
+      console.log(
+        JSON.stringify(
+          AnkiUtils.searchCards({ keyword: args[0], deck: args[1] }),
+          null,
+          2
+        )
+      );
+    } else {
+      console.log("Usage:");
+      console.log("  anki search [keyword] [deck]");
+      process.exit(1);
     }
   } catch (error) {
     console.error("Error:", error);
     process.exit(1);
-  } finally {
-    db.close();
   }
 }
 
