@@ -1,0 +1,12 @@
+{
+  "name": "anki-cli",
+  "version": "1.0.0",
+  "description": "CLI tool for interacting with Anki database",
+  "type": "module",
+  "bin": {
+    "anki": "./index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
